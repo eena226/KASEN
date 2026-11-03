@@ -1,0 +1,92 @@
+/*
+ * mqtt_tx.c: Map 6 (Send count routine)
+ *   - event-based publishing: send a bin's count as soon as it changes,
+ *     plus every bin at least every 2 seconds
+ *   - local buffering: if the link is down (or a publish fails), keep the
+ *     message in RAM and send it, oldest first, when the link is back
+ *
+ * Skeleton only: not built or tested. Needs the real MQTT publish function.
+ */
+
+#include <zephyr/kernel.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
+
+#define NUM_BINS        5
+#define BUF_MAX_MSGS    200        /* how many messages to keep while offline (team decision) */
+#define HEARTBEAT_MS    2000       /* SRS 2.0.1: send every bin at least this often */
+
+struct count_msg {
+	char    station_id[12];
+	uint8_t bin;               /* 1 to 5 */
+	char    part_name[24];
+	int32_t count;
+	int64_t timestamp_ms;      /* uptime for now; use real time once the hub provides it */
+};
+
+K_MSGQ_DEFINE(tx_buffer, sizeof(struct count_msg), BUF_MAX_MSGS, 4);
+
+/* Provided elsewhere */
+extern bool        network_link_up(void);
+extern int         mqtt_publish_count(const struct count_msg *m);   /* 0 = sent */
+extern const char *station_id_get(void);
+extern const char *part_name_get(int bin_index);
+
+static int32_t last_sent[NUM_BINS];
+static int64_t last_heartbeat_ms;
+static bool    first_run = true;
+
+/* Send buffered messages first, oldest first. Stop at the first failure. */
+static void flush_buffer(void)
+{
+	struct count_msg m;
+
+	while (network_link_up() && k_msgq_peek(&tx_buffer, &m) == 0) {
+		if (mqtt_publish_count(&m) != 0) {
+			break;                      /* try again next loop */
+		}
+		k_msgq_get(&tx_buffer, &m, K_NO_WAIT);
+	}
+}
+
+/* Publish now if possible; otherwise store it. Keeps messages in order. */
+static void send_or_buffer(const struct count_msg *m)
+{
+	bool buffer_empty = (k_msgq_num_used_get(&tx_buffer) == 0);
+
+	if (buffer_empty && network_link_up() && mqtt_publish_count(m) == 0) {
+		return;
+	}
+	while (k_msgq_put(&tx_buffer, m, K_NO_WAIT) != 0) {
+		struct count_msg dropped;
+
+		k_msgq_get(&tx_buffer, &dropped, K_NO_WAIT);   /* full: drop the oldest */
+	}
+}
+
+/* Call this every pass of the main loop (Map 1). */
+void send_counts(const int32_t counts[NUM_BINS])
+{
+	int64_t now = k_uptime_get();
+	bool heartbeat = first_run || (now - last_heartbeat_ms) >= HEARTBEAT_MS;
+
+	flush_buffer();
+
+	for (int i = 0; i < NUM_BINS; i++) {
+		if (!heartbeat && counts[i] == last_sent[i]) {
+			continue;                   /* nothing changed, nothing due */
+		}
+		struct count_msg m = {.bin = i + 1, .count = counts[i], .timestamp_ms = now};
+
+		strncpy(m.station_id, station_id_get(), sizeof(m.station_id) - 1);
+		strncpy(m.part_name, part_name_get(i), sizeof(m.part_name) - 1);
+		send_or_buffer(&m);
+		last_sent[i] = counts[i];
+	}
+
+	if (heartbeat) {
+		last_heartbeat_ms = now;
+		first_run = false;
+	}
+}
